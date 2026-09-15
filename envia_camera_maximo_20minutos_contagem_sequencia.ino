@@ -1,0 +1,535 @@
+#include "Arduino.h"
+#include "FS.h"
+#include "SD_MMC.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include "esp_camera.h"
+
+// ===================== PINOS AI-THINKER =====================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+#define ONBOARD_LED 4
+#define CHANNEL 1
+
+#define FILE_DATA_IN_MESSAGE 240
+
+// ===================== COMANDOS ESP-NOW =====================
+#define CMD_START_IMAGE 0x01
+#define CMD_IMAGE_DATA  0x02
+#define CMD_PING        0x10
+#define CMD_PONG        0x11
+
+// Nova foto 20 minutos APÓS concluir o envio
+const unsigned long photoIntervalAfterSend = 20UL * 60UL * 1000UL;
+
+// ===================== VARIÁVEIS =====================
+esp_now_peer_info_t slave;
+bool isPaired = false;
+
+int pictureNumber = 1;
+String fileName = "";
+File globalFile;
+
+uint32_t currentTransmitCurrentPosition = 0;
+uint32_t currentTransmitTotalPackages = 0;
+
+volatile bool sendNextPackageFlag = false;
+volatile bool transmissionRunning = false;
+
+volatile bool sendingControlMessage = false;
+
+bool pongJaEnviado = false;
+
+unsigned long nextPhotoTime = 0;
+bool firstPhotoTaken = false;
+
+// ===================== PROTÓTIPOS =====================
+void initCamera();
+void takePhoto();
+void startTransmit();
+void sendNextPackage();
+void ScanAndConnect();
+void addPeerIfNeeded(const uint8_t *mac);
+void sendPong(const uint8_t *mac);
+void findNextPictureNumber();
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len);
+#else
+void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len);
+#endif
+
+// ===================== SETUP =====================
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println(" ESP32-CAM MASTER - QUALIDADE MAXIMA");
+  Serial.println(" FOTO A CADA 20 MIN APOS ENVIO");
+  Serial.println(" SEM SOBRESCREVER IMAGENS");
+  Serial.println(" PING/PONG UNICO ATIVO");
+  Serial.println("======================================");
+
+  pinMode(ONBOARD_LED, OUTPUT);
+  digitalWrite(ONBOARD_LED, LOW);
+
+  initCamera();
+
+  if (!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("❌ Erro ao montar SD Card");
+    return;
+  }
+
+  Serial.println("✅ SD Card OK");
+
+  findNextPictureNumber();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ Erro ao iniciar ESP-NOW");
+    ESP.restart();
+  }
+
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_1M_L);
+
+  esp_now_register_send_cb(OnDataSent);
+  esp_now_register_recv_cb(OnDataRecv);
+
+  Serial.println("📡 ESP-NOW iniciado");
+  Serial.println("📷 Câmera em qualidade máxima");
+  Serial.println("📶 Aguardando Slave...");
+}
+
+// ===================== LOOP =====================
+void loop() {
+  if (!isPaired) {
+    ScanAndConnect();
+  }
+
+  if (sendNextPackageFlag && isPaired && transmissionRunning) {
+    sendNextPackage();
+  }
+
+  // Primeira foto: tira assim que conectar ao Slave
+  if (isPaired && !transmissionRunning && !firstPhotoTaken) {
+    firstPhotoTaken = true;
+    takePhoto();
+  }
+
+  // Próximas fotos: 20 minutos após concluir o envio anterior
+  if (isPaired && !transmissionRunning && firstPhotoTaken && nextPhotoTime > 0) {
+    if (millis() >= nextPhotoTime) {
+      nextPhotoTime = 0;
+      takePhoto();
+    }
+  }
+}
+
+// ===================== DESCOBRIR PRÓXIMO NÚMERO LIVRE =====================
+void findNextPictureNumber() {
+  pictureNumber = 1;
+
+  while (true) {
+    String testName = "/pic" + String(pictureNumber) + ".jpg";
+
+    if (!SD_MMC.exists(testName)) {
+      break;
+    }
+
+    pictureNumber++;
+  }
+
+  Serial.print("📁 Próxima imagem será: /pic");
+  Serial.print(pictureNumber);
+  Serial.println(".jpg");
+}
+
+// ===================== CAPTURAR FOTO =====================
+void takePhoto() {
+  digitalWrite(ONBOARD_LED, HIGH);
+
+  Serial.println();
+  Serial.println("📸 Capturando foto em qualidade máxima...");
+
+  for (int i = 0; i < 2; i++) {
+    camera_fb_t *temp = esp_camera_fb_get();
+    if (temp) esp_camera_fb_return(temp);
+    delay(100);
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+
+  if (!fb) {
+    Serial.println("❌ Falha ao capturar foto");
+    digitalWrite(ONBOARD_LED, LOW);
+    return;
+  }
+
+  fileName = "/pic" + String(pictureNumber++) + ".jpg";
+
+  File file = SD_MMC.open(fileName.c_str(), FILE_WRITE);
+
+  if (!file) {
+    Serial.println("❌ Erro ao criar arquivo no SD");
+    esp_camera_fb_return(fb);
+    digitalWrite(ONBOARD_LED, LOW);
+    return;
+  }
+
+  file.write(fb->buf, fb->len);
+  file.close();
+
+  Serial.print("💾 Foto salva: ");
+  Serial.println(fileName);
+
+  Serial.print("📦 Tamanho: ");
+  Serial.print(fb->len);
+  Serial.println(" bytes");
+
+  esp_camera_fb_return(fb);
+  digitalWrite(ONBOARD_LED, LOW);
+
+  if (isPaired) {
+    Serial.println("📤 Iniciando envio...");
+    startTransmit();
+  } else {
+    Serial.println("⚠️ Slave não conectado. Foto salva apenas no SD.");
+  }
+}
+
+// ===================== INICIAR TRANSMISSÃO =====================
+void startTransmit() {
+  if (globalFile) {
+    globalFile.close();
+  }
+
+  globalFile = SD_MMC.open(fileName.c_str(), FILE_READ);
+
+  if (!globalFile) {
+    Serial.println("❌ Erro ao abrir imagem para envio");
+    return;
+  }
+
+  size_t fileSize = globalFile.size();
+
+  currentTransmitCurrentPosition = 0;
+  currentTransmitTotalPackages = (fileSize + FILE_DATA_IN_MESSAGE - 1) / FILE_DATA_IN_MESSAGE;
+
+  Serial.print("📨 Total de pacotes: ");
+  Serial.println(currentTransmitTotalPackages);
+
+  uint8_t msg[5];
+
+  msg[0] = CMD_START_IMAGE;
+  msg[1] = (uint8_t)(currentTransmitTotalPackages >> 24);
+  msg[2] = (uint8_t)(currentTransmitTotalPackages >> 16);
+  msg[3] = (uint8_t)(currentTransmitTotalPackages >> 8);
+  msg[4] = (uint8_t)(currentTransmitTotalPackages);
+
+  transmissionRunning = true;
+  sendNextPackageFlag = false;
+
+  esp_now_send(slave.peer_addr, msg, sizeof(msg));
+}
+
+// ===================== ENVIAR PACOTE =====================
+void sendNextPackage() {
+  sendNextPackageFlag = false;
+
+  if (!globalFile) {
+    transmissionRunning = false;
+    return;
+  }
+
+  if (currentTransmitCurrentPosition >= currentTransmitTotalPackages) {
+    globalFile.close();
+    transmissionRunning = false;
+
+    Serial.println("✅ Imagem enviada com sucesso");
+
+    nextPhotoTime = millis() + photoIntervalAfterSend;
+
+    Serial.println("⏱️ Próxima foto em 20 minutos após conclusão do envio");
+    return;
+  }
+
+  uint8_t buffer[FILE_DATA_IN_MESSAGE + 3];
+
+  size_t remain = globalFile.size() - (currentTransmitCurrentPosition * FILE_DATA_IN_MESSAGE);
+  size_t packetSize = remain > FILE_DATA_IN_MESSAGE ? FILE_DATA_IN_MESSAGE : remain;
+
+  currentTransmitCurrentPosition++;
+
+  buffer[0] = CMD_IMAGE_DATA;
+  buffer[1] = (uint8_t)(currentTransmitCurrentPosition >> 8);
+  buffer[2] = (uint8_t)(currentTransmitCurrentPosition);
+
+  size_t bytesRead = globalFile.read(&buffer[3], packetSize);
+
+  if (bytesRead != packetSize) {
+    Serial.println("⚠️ Leitura incompleta do SD");
+  }
+
+  esp_now_send(slave.peer_addr, buffer, packetSize + 3);
+}
+
+// ===================== CALLBACK DE ENVIO =====================
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  if (sendingControlMessage) {
+    sendingControlMessage = false;
+    return;
+  }
+
+  if (!transmissionRunning) return;
+
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    sendNextPackageFlag = true;
+  } else {
+    if (currentTransmitCurrentPosition > 0) {
+      currentTransmitCurrentPosition--;
+      globalFile.seek(currentTransmitCurrentPosition * FILE_DATA_IN_MESSAGE);
+    }
+
+    sendNextPackageFlag = true;
+  }
+}
+
+// ===================== CALLBACK DE RECEPÇÃO =====================
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+  const uint8_t *mac = recv_info->src_addr;
+
+  if (len <= 0) return;
+
+  if (data[0] == CMD_PING) {
+    if (!pongJaEnviado) {
+      Serial.println("📥 PING recebido do intermediário");
+      sendPong(mac);
+      pongJaEnviado = true;
+    } else {
+      Serial.println("📥 PING recebido, mas PONG já foi enviado anteriormente");
+    }
+  }
+}
+#else
+void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
+  if (len <= 0) return;
+
+  if (data[0] == CMD_PING) {
+    if (!pongJaEnviado) {
+      Serial.println("📥 PING recebido do intermediário");
+      sendPong(mac);
+      pongJaEnviado = true;
+    } else {
+      Serial.println("📥 PING recebido, mas PONG já foi enviado anteriormente");
+    }
+  }
+}
+#endif
+
+// ===================== ENVIAR PONG =====================
+void sendPong(const uint8_t *mac) {
+  addPeerIfNeeded(mac);
+
+  uint8_t msg[1];
+  msg[0] = CMD_PONG;
+
+  sendingControlMessage = true;
+
+  esp_err_t result = esp_now_send(mac, msg, sizeof(msg));
+
+  if (result == ESP_OK) {
+    Serial.println("📤 PONG enviado uma única vez");
+  } else {
+    sendingControlMessage = false;
+    Serial.println("❌ Falha ao enviar PONG");
+  }
+}
+
+// ===================== ADICIONAR PEER SE PRECISAR =====================
+void addPeerIfNeeded(const uint8_t *mac) {
+  if (esp_now_is_peer_exist(mac)) return;
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = CHANNEL;
+  peerInfo.encrypt = false;
+
+  esp_now_add_peer(&peerInfo);
+}
+
+// ===================== PROCURAR SLAVE =====================
+void ScanAndConnect() {
+  Serial.println("🔎 Procurando Slave...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  int8_t n = WiFi.scanNetworks(false, true);
+
+  if (n <= 0) {
+    Serial.println("⚠️ Nenhum Wi-Fi encontrado");
+    delay(2000);
+    return;
+  }
+
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+
+    if (ssid.indexOf("Slave") == 0) {
+      Serial.print("✅ Slave encontrado: ");
+      Serial.println(WiFi.BSSIDstr(i));
+
+      int mac[6];
+
+      sscanf(
+        WiFi.BSSIDstr(i).c_str(),
+        "%02X:%02X:%02X:%02X:%02X:%02X",
+        &mac[0], &mac[1], &mac[2],
+        &mac[3], &mac[4], &mac[5]
+      );
+
+      memset(&slave, 0, sizeof(slave));
+
+      for (int j = 0; j < 6; j++) {
+        slave.peer_addr[j] = (uint8_t)mac[j];
+      }
+
+      slave.channel = CHANNEL;
+      slave.encrypt = false;
+
+      if (esp_now_is_peer_exist(slave.peer_addr)) {
+        esp_now_del_peer(slave.peer_addr);
+      }
+
+      if (esp_now_add_peer(&slave) == ESP_OK) {
+        isPaired = true;
+
+        esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_1M_L);
+
+        Serial.println("🔗 Conectado ao Slave");
+      } else {
+        Serial.println("❌ Erro ao adicionar peer");
+      }
+
+      WiFi.scanDelete();
+      return;
+    }
+  }
+
+  WiFi.scanDelete();
+
+  Serial.println("⚠️ Slave não encontrado");
+  delay(2000);
+}
+
+// ===================== INICIAR CÂMERA =====================
+void initCamera() {
+  camera_config_t config;
+
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    Serial.println("✅ PSRAM encontrada");
+
+    config.frame_size = FRAMESIZE_UXGA;
+    config.jpeg_quality = 4;
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+  } else {
+    Serial.println("⚠️ PSRAM não encontrada. Reduzindo qualidade.");
+
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 8;
+    config.fb_count = 1;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+
+  if (err != ESP_OK) {
+    Serial.printf("❌ Erro ao iniciar câmera: 0x%x\n", err);
+    ESP.restart();
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+
+  if (s) {
+    s->set_brightness(s, 1);
+    s->set_contrast(s, 1);
+    s->set_saturation(s, 1);
+    s->set_sharpness(s, 2);
+    s->set_denoise(s, 1);
+
+    s->set_quality(s, 4);
+    s->set_gainceiling(s, (gainceiling_t)6);
+
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_exposure_ctrl(s, 1);
+    s->set_aec2(s, 1);
+    s->set_gain_ctrl(s, 1);
+
+    s->set_hmirror(s, 0);
+    s->set_vflip(s, 0);
+  }
+
+  Serial.println("✅ Câmera iniciada");
+}
